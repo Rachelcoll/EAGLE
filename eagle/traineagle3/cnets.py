@@ -28,8 +28,7 @@ from torch import nn
 import os
 from transformers.integrations.deepspeed import HfDeepSpeedConfig
 from transformers.activations import ACT2FN
-from transformers import AutoTokenizer
-from modeling_llama_kv import LlamaForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM
 from configs import EConfig
 from safetensors import safe_open
 from datasets import load_dataset
@@ -206,20 +205,29 @@ class LlamaAttention(nn.Module):
 
     def _init_rope(self):
         if self.config.rope_scaling is None:
-            self.rotary_emb = LlamaRotaryEmbedding(self.head_dim, max_position_embeddings=self.max_position_embeddings)
+            scaling_type = "default"
+            scaling_factor = 1.0
         else:
-            scaling_type = self.config.rope_scaling["type"]
-            scaling_factor = self.config.rope_scaling["factor"]
-            if scaling_type == "linear":
-                self.rotary_emb = LlamaLinearScalingRotaryEmbedding(
-                    self.head_dim, max_position_embeddings=self.max_position_embeddings, scaling_factor=scaling_factor
-                )
-            elif scaling_type == "dynamic":
-                self.rotary_emb = LlamaDynamicNTKScalingRotaryEmbedding(
-                    self.head_dim, max_position_embeddings=self.max_position_embeddings, scaling_factor=scaling_factor
-                )
+            if isinstance(self.config.rope_scaling, dict):
+                scaling_type = self.config.rope_scaling.get("type", "default")
+                scaling_factor = self.config.rope_scaling.get("factor", 1.0)
             else:
-                raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
+                scaling_type = getattr(self.config.rope_scaling, "type", "default")
+                scaling_factor = getattr(self.config.rope_scaling, "factor", 1.0)
+        if scaling_type == "linear":
+            self.rotary_emb = LlamaLinearScalingRotaryEmbedding(
+                self.head_dim, max_position_embeddings=self.max_position_embeddings, scaling_factor=scaling_factor
+            )
+        elif scaling_type == "dynamic":
+            self.rotary_emb = LlamaDynamicNTKScalingRotaryEmbedding(
+                self.head_dim, max_position_embeddings=self.max_position_embeddings, scaling_factor=scaling_factor
+            )
+        elif scaling_type == "default":
+            self.rotary_emb = LlamaRotaryEmbedding(
+                self.head_dim, max_position_embeddings=self.max_position_embeddings
+            )
+        else:
+            raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
 
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
         return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
@@ -489,14 +497,20 @@ class Model(nn.Module):
         else:
             dschf = None
         self.midlayer = LlamaDecoderLayeremb(config)
-        self.gradient_checkpointing = self.train_config.gradient_checkpointing
+        self.gradient_checkpointing = self.train_config["gradient_checkpoint"]
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.hidden_size = config.hidden_size
         self.draft_vocab_size = config.draft_vocab_size
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.length = 7
-        self.target_model = LlamaForCausalLM.from_pretrained(path, torch_dtype=torch.float16)
+        self.hard_loss_weight = float(self.train_config.get("hard_loss_weight", 0.0))
+        self.easy_loss_beta = float(self.train_config.get("easy_loss_beta", 1.0))
+        if not 0.0 <= self.hard_loss_weight <= 1.0:
+            raise ValueError("hard_loss_weight must be in [0, 1].")
+        if self.easy_loss_beta <= 0.0:
+            raise ValueError("easy_loss_beta must be positive.")
+        self.target_model = AutoModelForCausalLM.from_pretrained(path, torch_dtype=torch.bfloat16)
         self.target_model.eval()
         self.fc=nn.Linear(self.hidden_size*3, self.hidden_size, bias=False)
         for param in self.target_model.parameters():
@@ -510,23 +524,32 @@ class Model(nn.Module):
             from safetensors import safe_open
             import json
             import os
+            from huggingface_hub import snapshot_download
+
+            # If path is a HuggingFace repo ID (not a local dir), resolve to local cache
+            if not os.path.isdir(path):
+                local_path = snapshot_download(repo_id=path, allow_patterns=["model.safetensors.index.json", "pytorch_model.bin.index.json", "*.safetensors"])
+            else:
+                local_path = path
+
             try:
-                with open(os.path.join(path, "model.safetensors.index.json"), "r") as f:
+                with open(os.path.join(local_path, "model.safetensors.index.json"), "r") as f:
                     index_json = json.loads(f.read())
                     emb_path = index_json["weight_map"]["model.embed_tokens.weight"]
-                with safe_open(os.path.join(path, emb_path),
+                with safe_open(os.path.join(local_path, emb_path),
                                framework="pt",
                                device="cpu") as f:
                     tensor_slice = f.get_slice("model.embed_tokens.weight")
                     vocab_size, hidden_dim = tensor_slice.get_shape()
                     tensor = tensor_slice[:, :hidden_dim].float()
             except:
-                with open(os.path.join(path, "pytorch_model.bin.index.json"), "r") as f:
+                with open(os.path.join(local_path, "pytorch_model.bin.index.json"), "r") as f:
                     index_json = json.loads(f.read())
                     emb_path = index_json["weight_map"]["model.embed_tokens.weight"]
-                weights = torch.load(os.path.join(path, emb_path))
+                weights = torch.load(os.path.join(local_path, emb_path))
                 tensor = weights["model.embed_tokens.weight"].float()
-            self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx, _weight=tensor)
+                vocab_size, hidden_dim = tensor.shape
+            self.embed_tokens = nn.Embedding(vocab_size, hidden_dim, self.padding_idx, _weight=tensor)
 
         self.lm_head = nn.Linear(config.hidden_size, config.draft_vocab_size, bias=False)
 
@@ -541,7 +564,8 @@ class Model(nn.Module):
             dataset = dataset['train']
             # dataset = dataset.select(range(96))
             original_columns1 = dataset.column_names
-            num_proc = 48
+            num_proc = 8
+            max_len = self.train_config["max_len"]
 
 
             def preprocess_function(examples):
@@ -588,16 +612,15 @@ class Model(nn.Module):
                     # When construct draft model vocab, 
                     # filter out samples which is longer than max_len,
                     # instead of truncating them.
-                    if len(input_ids) > self.train_config.max_len:
+                    if len(input_ids) > max_len:
                         continue
                     loss_mask = torch.ones_like(input_ids)
                     # print(i)
 
-                    sep = "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+                    sep = "<|im_start|>assistant"
+                    sep2 = "<|im_start|>user"
 
                     total_len = len(input_ids)
-
-                    sep2 = "<|eot_id|><|start_header_id|>user<|end_header_id|>"
                     turns = conversation.split(sep2)
 
                     turns[1] = turns[0] + sep2 + turns[1]
@@ -644,7 +667,8 @@ class Model(nn.Module):
                 batched=True,
                 num_proc=num_proc,
                 remove_columns=original_columns1,
-                load_from_cache_file=False
+                load_from_cache_file=True,
+                desc="Scanning tokens",
             )
             #dataset.set_format(type="torch")
 
@@ -713,10 +737,11 @@ class Model(nn.Module):
     @torch.no_grad()
     def dataprepare(self, input_ids, attention_mask, loss_mask):
         device = input_ids.device
-        outs = self.target_model(input_ids=input_ids, attention_mask=attention_mask)
-        hidden_states0 = outs.hidden_states[0]
-        hidden_states1 = outs.hidden_states[1]
-        hidden_states2 = outs.hidden_states[2]
+        outs = self.target_model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
+        hid_len = len(outs.hidden_states)
+        hidden_states0 = outs.hidden_states[2]
+        hidden_states1 = outs.hidden_states[hid_len // 2]
+        hidden_states2 = outs.hidden_states[hid_len - 3]
         hidden_states=torch.cat((hidden_states0,hidden_states1,hidden_states2),dim=-1)
         # hidden_states=torch.cat((hidden_states0,hidden_states1),dim=-1)
         target = outs.logits
@@ -851,8 +876,13 @@ class Model(nn.Module):
             logits = self.lm_head(hidden_states_out)
             logits = logits.float()
             out_logp = nn.LogSoftmax(dim=2)(logits)
-            plogp = target_p * out_logp
-            loss = -torch.sum(position_mask * plogp, 2).mean()
+            token_ce = -(target_p * out_logp).sum(dim=2)
+            easy_token_score = torch.exp(-self.easy_loss_beta * token_ce)
+            easy_token_loss = 1.0 - easy_token_score
+
+            token_loss = self.hard_loss_weight * token_ce + (1.0 - self.hard_loss_weight) * easy_token_loss
+
+            loss = -torch.sum(position_mask * token_loss, 2).mean()
             plosses.append(loss)
             with torch.no_grad():
                 acces.append(((logits.argmax(-1) == target_p.argmax(-1)) * position_mask.squeeze(-1)).sum().item() / (

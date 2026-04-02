@@ -1,16 +1,20 @@
 import argparse
 import deepspeed
+import os
+from datetime import datetime
 
 parser = argparse.ArgumentParser(description='sp')
-parser.add_argument('--basepath', type=str, default='/home/lyh/weights/hf/llama31chat/8B/')
+parser.add_argument('--basepath', type=str, default='Qwen/Qwen3-8B')
 parser.add_argument('--trainpath', type=str,
-                    default="/home/lyh/code/nlp/developing/vllmbase/vllm/gedata/l318b.jsonl")
+                    default="/home/runxin/specdec/EAGLE/eagle/data/qwen3_eagle3/train.jsonl")
 parser.add_argument('--testpath', type=str,
-                    default="/home/lyh/code/nlp/developing/vllmbase/vllm/gedata/0318.json")
-parser.add_argument('--savedir', type=str, default='0')
+                    default="/home/runxin/specdec/EAGLE/eagle/data/qwen3_eagle3/test.jsonl")
+parser.add_argument('--savedir', type=str, default='train_qwen3_checkpoint')
 parser.add_argument("--local_rank", type=int, default=-1, help="local_rank for distributed training on gpus")
 parser = deepspeed.add_config_arguments(parser)
 args = parser.parse_args()
+time_suffix = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+save_dir = os.path.join(args.savedir, time_suffix)
 import json
 import re
 
@@ -19,16 +23,15 @@ with open(deepspeed_config) as f:
     ds_config = json.load(f)
 train_config = {
     "bs": ds_config["train_micro_batch_size_per_gpu"],
-    "num_epochs": 40,
-    "num_workers": 2,
+    "num_epochs": 3,
+    "num_workers": 4,
     "max_len": 2048,
     "config_path": "config.json",
-    "gradient_checkpoint": True
+    "gradient_checkpoint": False
 }
 
 from safetensors import safe_open
 from transformers import AutoModelForCausalLM, AutoTokenizer
-import os
 # os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
 import torch
 from cnets import padding
@@ -61,7 +64,7 @@ def build_dataset_rank(
     ds = ds.shuffle(seed=42)
     ds1 = ds
     original_columns1 = ds1.column_names
-    num_proc = 8
+    num_proc = 4
 
     def preprocess_function(examples):
         new_examples = {
@@ -110,18 +113,16 @@ def build_dataset_rank(
             loss_mask = torch.ones_like(input_ids)
             # print(i)
 
-            sep = "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+            sep = "<|im_start|>assistant"
 
             total_len = len(input_ids)
 
-            sep2 = "<|eot_id|><|start_header_id|>user<|end_header_id|>"
+            sep2 = "<|im_start|>user"
             turns = conversation.split(sep2)
-
             turns[1] = turns[0] + sep2 + turns[1]
             turns = turns[1:]
 
-            cur_len = 1
-            loss_mask[:cur_len] = 0
+            cur_len = 0 # modified
             for i, turn in enumerate(turns):
                 if turn == "":
                     break
@@ -132,16 +133,16 @@ def build_dataset_rank(
                     break
                 parts[0] += sep
                 # "-2" is hardcoded for the Llama tokenizer to make the offset correct.
-                instruction_len = len(tokenizer(parts[0]).input_ids) - 1
+                instruction_len = len(tokenizer(parts[0]).input_ids) + 1
 
                 # Ignore the user instructions
                 if i == 0:
-                    loss_mask[cur_len: cur_len + instruction_len - 2] = 0
+                    loss_mask[cur_len: cur_len + instruction_len] = 0
                 else:
-                    loss_mask[cur_len - 3: cur_len + instruction_len + 1] = 0
+                    loss_mask[cur_len: cur_len + instruction_len + 2] = 0
                 cur_len += turn_len
                 if i != 0:
-                    cur_len += 3
+                    cur_len += 2
                 # cur_len+=2
 
                 # if i != 0 and not tokenizer.legacy:
@@ -150,7 +151,7 @@ def build_dataset_rank(
 
             loss_mask[cur_len:] = 0
             attention_mask = torch.ones_like(loss_mask)
-
+            
             # new_examples["conversation"].append(conversation)
             new_examples["input_ids"].append(input_ids[None, :])
             new_examples["loss_mask"].append(loss_mask[None, :])
@@ -163,7 +164,7 @@ def build_dataset_rank(
         batched=True,
         num_proc=num_proc,
         remove_columns=original_columns1,
-        load_from_cache_file=False
+        load_from_cache_file=True
     )
 
 
@@ -211,7 +212,6 @@ model = Model(config, ds_config, train_config, path=args.basepath, load_emb=True
 model.scandata(args.trainpath, args.basepath)
 
 
-criterion = nn.SmoothL1Loss(reduction="none")
 
 num_epochs = train_config["num_epochs"]
 
@@ -227,9 +227,9 @@ if global_rank == 0:
     import wandb
 
     wandb.login(key="")
-    wandb.init(project="l382", entity="yuhui-li", config=ds_config)
+    wandb.init(project="eagle-qwen3-train", config=ds_config, name=f"eagle3-qwen3-{time_suffix}")
 
-os.makedirs(args.savedir, exist_ok=True)
+os.makedirs(save_dir, exist_ok=True)
 
 sampler = DistributedSampler(testdataset, num_replicas=world_size, rank=global_rank, shuffle=False)
 test_loader = DataLoader(testdataset, batch_size=train_config["bs"], sampler=sampler, num_workers=4, pin_memory=True,
@@ -256,7 +256,7 @@ def find_max_state_with_file(directory, filename="zero_to_fp32.py"):
     return f"{directory}/state_{max_a}", max_a + 1
 
 
-checkpoint_path, start_epoch = find_max_state_with_file(args.savedir)
+checkpoint_path, start_epoch = find_max_state_with_file(save_dir)
 if checkpoint_path:
     print(f"load from {checkpoint_path}")
     model_engine.load_checkpoint(checkpoint_path)
@@ -346,6 +346,6 @@ for epoch in range(start_epoch, num_epochs):
     # clear out the redundance cahce after each step
     torch.cuda.empty_cache()
 
-    model_engine.save_16bit_model(f"{args.savedir}/state_{epoch}", exclude_frozen_parameters=True)
-    if epoch % 10 == 0:
-        deepspeed.DeepSpeedEngine.save_checkpoint(model_engine, save_dir=f"{args.savedir}/state_{epoch}")
+    model_engine.save_16bit_model(f"{save_dir}/state_{epoch}", exclude_frozen_parameters=True)
+    if epoch % 1 == 0:
+        deepspeed.DeepSpeedEngine.save_checkpoint(model_engine, save_dir=f"{save_dir}/state_{epoch}")
