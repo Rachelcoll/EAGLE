@@ -27,7 +27,12 @@ train_config = {
     "num_workers": 4,
     "max_len": 2048,
     "config_path": "config.json",
-    "gradient_checkpoint": False
+    "gradient_checkpoint": False,
+    "easy_loss_beta": 1.0,
+    "hard_loss_weight_start": 1.0,
+    "hard_loss_weight_end": 0.0,
+    "hard_loss_weight_warmup_ratio": 0.1,
+    "hard_loss_weight_anneal_ratio": 0.5,
 }
 
 from safetensors import safe_open
@@ -203,6 +208,35 @@ class DataCollatorWithPadding:
         return batch
 
 
+def get_hard_loss_weight(step, total_steps, train_config):
+    start = float(train_config["hard_loss_weight_start"])
+    end = float(train_config["hard_loss_weight_end"])
+    warmup_ratio = float(train_config["hard_loss_weight_warmup_ratio"])
+    anneal_ratio = float(train_config["hard_loss_weight_anneal_ratio"])
+
+    if not 0.0 <= warmup_ratio <= anneal_ratio <= 1.0:
+        raise ValueError("hard_loss_weight schedule ratios must satisfy 0 <= warmup <= anneal <= 1.")
+
+    if total_steps <= 0:
+        return end
+    if total_steps == 1:
+        return start
+
+    progress = min(max(step / float(total_steps - 1), 0.0), 1.0)
+    if progress <= warmup_ratio:
+        return start
+    if progress >= anneal_ratio:
+        return end
+
+    decay_progress = (progress - warmup_ratio) / (anneal_ratio - warmup_ratio)
+    return start + (end - start) * decay_progress
+
+
+def set_model_hard_loss_weight(model_engine, weight):
+    target_model = model_engine.module if hasattr(model_engine, "module") else model_engine
+    target_model.set_hard_loss_weight(weight)
+
+
 tokenizer = AutoTokenizer.from_pretrained(args.basepath)
 traindataset = build_dataset_rank(tokenizer, args.trainpath)
 testdataset = build_dataset_rank(tokenizer, args.testpath)
@@ -240,6 +274,8 @@ train_loader = DataLoader(traindataset, batch_size=train_config["bs"], sampler=t
                           pin_memory=True,
                           collate_fn=DataCollatorWithPadding())
 
+total_train_steps = num_epochs * len(train_loader)
+
 
 def find_max_state_with_file(directory, filename="zero_to_fp32.py"):
     max_a = -1
@@ -266,6 +302,8 @@ if checkpoint_path:
 for epoch in range(start_epoch, num_epochs):
     train_sampler.set_epoch(epoch+1)
     print(f"Now training epoch {epoch}")
+    epoch_end_step = (epoch + 1) * len(train_loader) - 1
+    epoch_end_hard_loss_weight = get_hard_loss_weight(epoch_end_step, total_train_steps, train_config)
 
     model.train()
     epoch_acces = [[] for _ in range(model.length)]
@@ -273,6 +311,9 @@ for epoch in range(start_epoch, num_epochs):
 
 
     for batch_idx, data in enumerate(tqdm(train_loader)):
+        current_step = epoch * len(train_loader) + batch_idx
+        current_hard_loss_weight = get_hard_loss_weight(current_step, total_train_steps, train_config)
+        set_model_hard_loss_weight(model_engine, current_hard_loss_weight)
 
         model.zero_grad()
 
@@ -318,6 +359,7 @@ for epoch in range(start_epoch, num_epochs):
 
     epoch_acces = [[] for _ in range(model.length)]
     epoch_plosses = [[] for _ in range(model.length)]
+    set_model_hard_loss_weight(model_engine, epoch_end_hard_loss_weight)
 
     for batch_idx, data in enumerate(tqdm(test_loader)):
         with torch.no_grad():

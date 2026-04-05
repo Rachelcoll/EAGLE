@@ -505,6 +505,7 @@ class Model(nn.Module):
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.length = 7
         self.hard_loss_weight = float(self.train_config.get("hard_loss_weight", 0.0))
+        self.current_hard_loss_weight = self.hard_loss_weight
         self.easy_loss_beta = float(self.train_config.get("easy_loss_beta", 1.0))
         if not 0.0 <= self.hard_loss_weight <= 1.0:
             raise ValueError("hard_loss_weight must be in [0, 1].")
@@ -711,6 +712,12 @@ class Model(nn.Module):
         self.register_buffer("t2d", t2d)
         self.l1smooth = nn.SmoothL1Loss(reduction="none")
 
+    def set_hard_loss_weight(self, weight):
+        weight = float(weight)
+        if not 0.0 <= weight <= 1.0:
+            raise ValueError("current hard_loss_weight must be in [0, 1].")
+        self.current_hard_loss_weight = weight
+
     def _prepare_decoder_attention_mask(self, attention_mask, input_shape, inputs_embeds, past_key_values_length):
         # create causal mask
         # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
@@ -880,9 +887,12 @@ class Model(nn.Module):
             easy_token_score = torch.exp(-self.easy_loss_beta * token_ce)
             easy_token_loss = 1.0 - easy_token_score
 
-            token_loss = self.hard_loss_weight * token_ce + (1.0 - self.hard_loss_weight) * easy_token_loss
+            token_loss = (
+                self.current_hard_loss_weight * token_ce
+                + (1.0 - self.current_hard_loss_weight) * easy_token_loss
+            )
 
-            loss = -torch.sum(position_mask * token_loss, 2).mean()
+            loss = torch.sum(position_mask * token_loss[..., None], 2).mean()
             plosses.append(loss)
             with torch.no_grad():
                 acces.append(((logits.argmax(-1) == target_p.argmax(-1)) * position_mask.squeeze(-1)).sum().item() / (
