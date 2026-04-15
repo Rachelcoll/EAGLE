@@ -507,6 +507,7 @@ class Model(nn.Module):
         self.hard_loss_weight = float(self.train_config.get("hard_loss_weight", 0.0))
         self.current_hard_loss_weight = self.hard_loss_weight
         self.easy_loss_beta = float(self.train_config.get("easy_loss_beta", 1.0))
+        self.hard_loss_c = float(self.train_config.get("hard_loss_c", 1.0))
         if not 0.0 <= self.hard_loss_weight <= 1.0:
             raise ValueError("hard_loss_weight must be in [0, 1].")
         if self.easy_loss_beta <= 0.0:
@@ -883,16 +884,24 @@ class Model(nn.Module):
             logits = self.lm_head(hidden_states_out)
             logits = logits.float()
             out_logp = nn.LogSoftmax(dim=2)(logits)
+
             token_ce = -(target_p * out_logp).sum(dim=2)
-            easy_token_score = torch.exp(-self.easy_loss_beta * token_ce)
-            easy_token_loss = 1.0 - easy_token_score
+            alpha = self.current_hard_loss_weight
+            easy_token_loss = 1.0 - torch.exp(-self.easy_loss_beta * token_ce)
+            raw_hard = torch.exp(self.easy_loss_beta * token_ce)
+            mask_2d = position_mask.squeeze(-1)
+            raw_hard_masked = raw_hard * mask_2d + (-1e9) * (1 - mask_2d)
+            max_per_sample = raw_hard_masked.max(dim=-1, keepdim=True).values
+            d = (raw_hard / (max_per_sample + 1e-8)) * mask_2d
 
             token_loss = (
-                self.current_hard_loss_weight * token_ce
-                + (1.0 - self.current_hard_loss_weight) * easy_token_loss
+                alpha * token_ce
+                + (1.0 - alpha) * alpha * easy_token_loss
+                + (1.0 - alpha) ** 2 * hard_token_loss
             )
 
             loss = torch.sum(position_mask * token_loss[..., None], 2).mean()
+
             plosses.append(loss)
             with torch.no_grad():
                 acces.append(((logits.argmax(-1) == target_p.argmax(-1)) * position_mask.squeeze(-1)).sum().item() / (

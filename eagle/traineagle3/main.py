@@ -6,9 +6,9 @@ from datetime import datetime
 parser = argparse.ArgumentParser(description='sp')
 parser.add_argument('--basepath', type=str, default='Qwen/Qwen3-8B')
 parser.add_argument('--trainpath', type=str,
-                    default="/home/runxin/specdec/EAGLE/eagle/data/qwen3_eagle3/train.jsonl")
+                    default="/home/runxin/EAGLE/eagle/data/qwen3_eagle3/train.jsonl")
 parser.add_argument('--testpath', type=str,
-                    default="/home/runxin/specdec/EAGLE/eagle/data/qwen3_eagle3/test.jsonl")
+                    default="/home/runxin/EAGLE/eagle/data/qwen3_eagle3/test.jsonl")
 parser.add_argument('--savedir', type=str, default='train_qwen3_checkpoint')
 parser.add_argument("--local_rank", type=int, default=-1, help="local_rank for distributed training on gpus")
 parser = deepspeed.add_config_arguments(parser)
@@ -33,6 +33,7 @@ train_config = {
     "hard_loss_weight_end": 0.0,
     "hard_loss_weight_warmup_ratio": 0.1,
     "hard_loss_weight_anneal_ratio": 0.5,
+    "hard_loss_c": 1.0,
 }
 
 from safetensors import safe_open
