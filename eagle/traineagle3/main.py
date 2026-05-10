@@ -10,6 +10,8 @@ parser.add_argument('--trainpath', type=str,
 parser.add_argument('--testpath', type=str,
                     default="/home/runxin/specdec/EAGLE/eagle/data/qwen3_eagle3/test.jsonl")
 parser.add_argument('--savedir', type=str, default='train_qwen3_checkpoint')
+parser.add_argument('--draftpath', type=str,
+                    default="/home/runxin/specdec/EAGLE/eagle/traineagle3/train_qwen3_checkpoint/2026-03-31_09-37-09/state_2")
 parser.add_argument("--local_rank", type=int, default=-1, help="local_rank for distributed training on gpus")
 parser = deepspeed.add_config_arguments(parser)
 args = parser.parse_args()
@@ -27,7 +29,17 @@ train_config = {
     "num_workers": 4,
     "max_len": 2048,
     "config_path": "config.json",
-    "gradient_checkpoint": False
+    "gradient_checkpoint": False,
+    "use_skd_rollout": True,
+    "skd_gamma": 6,
+    "skd_max_new_tokens": 32,
+    "skd_teacher_k": 25,
+    "skd_teacher_p": 0.0,
+    "skd_temperature": 0.5,
+    "skd_student_temperature": 0.5,
+    "skd_teacher_temperature": 0.2,
+    "skd_rollout_every": 8,
+    "skd_seed_with_teacher": True,
 }
 
 from safetensors import safe_open
@@ -208,7 +220,8 @@ traindataset = build_dataset_rank(tokenizer, args.trainpath)
 testdataset = build_dataset_rank(tokenizer, args.testpath)
 
 config = EConfig.from_pretrained(train_config["config_path"])
-model = Model(config, ds_config, train_config, path=args.basepath, load_emb=True, load_head=True)
+model = Model(config, ds_config, train_config, path=args.basepath, load_emb=True, load_head=True,
+              draftpath=args.draftpath)
 model.scandata(args.trainpath, args.basepath)
 
 
@@ -279,6 +292,10 @@ for epoch in range(start_epoch, num_epochs):
         plosses, vlosses, acces = model_engine(input_ids=data["input_ids"].to(rank),
                                                attention_mask=data["attention_mask"].to(rank),
                                                loss_mask=data["loss_mask"],
+                                               skd_rollout=(
+                                                   train_config["use_skd_rollout"]
+                                                   and batch_idx % 1 == 0
+                                               ),
                                                )
 
         ploss_weight = [0.8 ** i for i in range(len(plosses))]
@@ -295,6 +312,11 @@ for epoch in range(start_epoch, num_epochs):
                 logdict[f"train/ploss_{i}"] = plosses[i].item()
             for i in range(len(acces)):
                 logdict[f"train/acc_{i}"] = acces[i]
+            skd_stats = getattr(model_engine.module, "last_skd_stats", None)
+            if skd_stats:
+                logdict["train/skd_accept_rate"] = skd_stats["accept_rate"]
+                logdict["train/skd_correction_rate"] = skd_stats["correction_rate"]
+                logdict["train/skd_avg_rollout_len"] = skd_stats["avg_rollout_len"]
             wandb.log(logdict)
         epoch_acces = [epoch_acces[i] + [acces[i]] for i in range(len(acces))]
         epoch_plosses = [epoch_plosses[i] + [plosses[i].item()] for i in range(len(plosses))]

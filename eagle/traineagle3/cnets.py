@@ -258,7 +258,10 @@ class LlamaAttention(nn.Module):
         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
 
-        cos, sin = self.rotary_emb(query_states, seq_len=q_len + lck)
+        rotary_seq_len = q_len + lck
+        if position_ids is not None:
+            rotary_seq_len = max(rotary_seq_len, int((position_ids + lck).max().item()) + 1)
+        cos, sin = self.rotary_emb(query_states, seq_len=rotary_seq_len)
         cos, sin = cos.to(query_states.device), sin.to(query_states.device)
         # query_states = apply_rotary_pos_emb(query_states, cos, sin, position_ids)
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids + lck)
@@ -302,13 +305,14 @@ class LlamaAttention(nn.Module):
 
         # upcast attention to fp32
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        attn_weights0 = attn_weights[..., :q_len]
+        first_cache_len = v0.shape[2]
+        attn_weights0 = attn_weights[..., :first_cache_len]
 
         attn_output = torch.matmul(attn_weights0, v0)
 
         for i in range(1, lck):
             vi = cache_v[i]
-            attn_weightsi = attn_weights[..., q_len + i - 1]
+            attn_weightsi = attn_weights[..., first_cache_len + i - 1]
             attn_outputi = attn_weightsi[..., None] * vi
             attn_output = attn_output + attn_outputi
 
@@ -486,7 +490,7 @@ def merge_dicts(dicts):
 
 
 class Model(nn.Module):
-    def __init__(self, config, ds_config, training_config, load_head=False, load_emb=True, path=None):
+    def __init__(self, config, ds_config, training_config, load_head=False, load_emb=True, path=None, draftpath=None):
         super().__init__() 
         # self.layers = nn.ModuleList(
         #     [LlamaDecoderLayer(config, index=index) for index in range(config.num_hidden_layers)])
@@ -506,6 +510,7 @@ class Model(nn.Module):
         self.length = 7
         self.hard_loss_weight = float(self.train_config.get("hard_loss_weight", 0.0))
         self.easy_loss_beta = float(self.train_config.get("easy_loss_beta", 1.0))
+        self.last_skd_stats = None
         if not 0.0 <= self.hard_loss_weight <= 1.0:
             raise ValueError("hard_loss_weight must be in [0, 1].")
         if self.easy_loss_beta <= 0.0:
@@ -555,6 +560,41 @@ class Model(nn.Module):
 
         for param in self.embed_tokens.parameters():
             param.requires_grad = False
+
+        if draftpath is not None:
+            self.load_draft_checkpoint(draftpath)
+
+    def load_draft_checkpoint(self, draftpath):
+        checkpoint_path = draftpath
+        if os.path.isdir(checkpoint_path):
+            checkpoint_path = os.path.join(checkpoint_path, "pytorch_model.bin")
+        if not os.path.exists(checkpoint_path):
+            raise FileNotFoundError(f"draft checkpoint not found: {checkpoint_path}")
+
+        state_dict = torch.load(checkpoint_path, map_location="cpu")
+        if isinstance(state_dict, dict):
+            if "module" in state_dict:
+                state_dict = state_dict["module"]
+            elif "state_dict" in state_dict:
+                state_dict = state_dict["state_dict"]
+
+        draft_prefixes = ("midlayer.", "norm.", "fc.", "lm_head.", "d2t", "t2d")
+        current_state = self.state_dict()
+        draft_state = {}
+        skipped_keys = []
+        for key, value in state_dict.items():
+            if not key.startswith(draft_prefixes):
+                skipped_keys.append(key)
+                continue
+            if key not in current_state or current_state[key].shape != value.shape:
+                skipped_keys.append(key)
+                continue
+            draft_state[key] = value
+
+        self.load_state_dict(draft_state, strict=False)
+        print(f"Loaded {len(draft_state)} draft checkpoint tensors from {checkpoint_path}")
+        if skipped_keys:
+            print(f"Skipped {len(skipped_keys)} incompatible or non-draft checkpoint tensors.")
 
     def scandata(self, datapath, tokenizerpath):
         N = self.draft_vocab_size
@@ -734,6 +774,486 @@ class Model(nn.Module):
 
         return combined_attention_mask
 
+    def _sample_token(self, logits, temperature=1.0):
+        logits = logits.float()
+        if temperature is None or temperature <= 0:
+            return torch.argmax(logits, dim=-1, keepdim=True)
+
+        probs = torch.softmax(logits / temperature, dim=-1)
+        if not torch.isfinite(probs).all() or probs.sum(dim=-1).min() <= 0:
+            return torch.argmax(logits, dim=-1, keepdim=True)
+        return torch.multinomial(probs, num_samples=1)
+
+    def _teacher_accepts(self, token, teacher_logits):
+        target_tokenizer = AutoTokenizer.from_pretrained('Qwen/Qwen3-8B')
+        teacher_k = int(self.train_config.get("skd_teacher_k", 10))
+        teacher_p = float(self.train_config.get("skd_teacher_p", 0.0))
+        token = token.view(-1)[0]
+        teacher_logits = teacher_logits.float()
+
+        if teacher_k > 0:
+            teacher_k = min(teacher_k, teacher_logits.shape[-1])
+            topk_ids = torch.topk(teacher_logits, teacher_k, dim=-1).indices
+            print(f"token={token.item()} ('{target_tokenizer.decode([token.item()])}'), "
+                    f"top5={topk_ids[0, :5].tolist()} "
+                    f"({[target_tokenizer.decode([t]) for t in topk_ids[0, :5].tolist()]}), "
+                    f"token_rank={(teacher_logits.argsort(descending=True)[0] == token).nonzero().item()}")
+            return bool((topk_ids == token).any().item())
+
+        if teacher_p > 0.0:
+            sorted_logits, sorted_indices = torch.sort(teacher_logits, descending=True, dim=-1)
+            sorted_probs = torch.softmax(sorted_logits, dim=-1)
+            cumulative_probs = sorted_probs.cumsum(dim=-1)
+            keep_mask = cumulative_probs - sorted_probs <= teacher_p
+            keep_mask[..., 0] = True
+            return bool((sorted_indices[keep_mask] == token).any().item())
+
+        return True
+
+    def _teacher_acceptance_mask(self, candidate_ids, teacher_logits):
+        teacher_k = int(self.train_config.get("skd_teacher_k", 10))
+        teacher_p = float(self.train_config.get("skd_teacher_p", 0.0))
+        candidate_ids = candidate_ids.to(device=teacher_logits.device, dtype=torch.long)
+        teacher_logits = teacher_logits.float()
+
+        if teacher_k > 0:
+            teacher_k = min(teacher_k, teacher_logits.shape[-1])
+            selected_tokens = torch.topk(teacher_logits, teacher_k, dim=-1).indices
+            return (selected_tokens == candidate_ids.unsqueeze(-1)).any(dim=-1)
+
+        if teacher_p > 0.0:
+            sorted_logits, sorted_indices = torch.sort(teacher_logits, descending=True, dim=-1)
+            sorted_probs = torch.softmax(sorted_logits, dim=-1)
+            cumulative_probs = sorted_probs.cumsum(dim=-1)
+            keep_mask = cumulative_probs - sorted_probs <= teacher_p
+            keep_mask[..., 0] = True
+            selected_tokens = sorted_indices.masked_fill(~keep_mask, -1)
+            return (selected_tokens == candidate_ids.unsqueeze(-1)).any(dim=-1)
+
+        return torch.ones(candidate_ids.shape, dtype=torch.bool, device=teacher_logits.device)
+
+    def _debug_teacher_acceptance(self, candidate_ids, teacher_logits, accepted_mask, accepted_prefix_len, confirmed_count):
+
+        tokenizer_name = self.train_config.get("skd_debug_tokenizer", "Qwen/Qwen3-8B")
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+        self._skd_debug_tokenizer = tokenizer
+        def decode_token(token_id):
+            token_id = int(token_id)
+            if tokenizer is None:
+                return str(token_id)
+            try:
+                return f"{token_id} ('{tokenizer.decode([token_id])}')"
+            except Exception:
+                return str(token_id)
+
+        topn = min(int(self.train_config.get("skd_debug_topn", 5)), teacher_logits.shape[-1])
+        top_ids = torch.topk(teacher_logits[0], topn, dim=-1).indices
+        print(
+            f"[skd-debug] accepted_mask={accepted_mask.tolist()}, "
+            f"accepted_prefix_len={accepted_prefix_len}, confirmed_count={confirmed_count}"
+        )
+        for pos in range(candidate_ids.shape[1]):
+            token = candidate_ids[0, pos]
+            token_logit = teacher_logits[0, pos, token]
+            token_rank = int((teacher_logits[0, pos] > token_logit).sum().item())
+            top_list = top_ids[pos].tolist()
+            decoded_top = [decode_token(token_id) for token_id in top_list]
+            status = "ACCEPT" if bool(accepted_mask[pos].item()) else "REJECT"
+            print(
+                f"[skd-debug] pos={pos} {status} token={decode_token(token.item())}, "
+                f"rank={token_rank}, top{topn}={top_list} ({decoded_top})"
+            )
+
+    def _draft_to_target_token(self, draft_token):
+        draft_token = draft_token.to(dtype=torch.long)
+        if self.draft_vocab_size == self.vocab_size:
+            return draft_token
+        d2t = self.d2t.to(draft_token.device)
+        return draft_token + d2t[draft_token]
+
+    def _target_hidden_from_outputs(self, outputs):
+        hid_len = len(outputs.hidden_states)
+        hidden_states0 = outputs.hidden_states[2]
+        hidden_states1 = outputs.hidden_states[hid_len // 2]
+        hidden_states2 = outputs.hidden_states[hid_len - 3]
+        return torch.cat((hidden_states0, hidden_states1, hidden_states2), dim=-1)
+
+    def _crop_teacher_past(self, past_key_values, keep_len):
+        if hasattr(past_key_values, "crop"):
+            past_key_values.crop(keep_len)
+            return past_key_values
+
+        cropped = []
+        for layer_past in past_key_values:
+            cropped.append(tuple(past[:, :, :keep_len, :].contiguous() for past in layer_past))
+        return tuple(cropped)
+
+    @torch.no_grad()
+    def _teacher_forward_with_cache(self, token_ids, past_key_values, output_hidden_states=True, use_cache=True):
+        return self.target_model(
+            input_ids=token_ids,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            output_hidden_states=output_hidden_states,
+        )
+
+    @torch.no_grad()
+    def _eagle_draft_prefill(self, hidden_context, context_ids): # context_ids: generated tokens; hidden_context: target model hidden states
+        device = context_ids.device
+        draft_input_ids = context_ids[:, 1:]
+        if hidden_context.shape[1] != draft_input_ids.shape[1]:
+            raise RuntimeError(
+                f"EAGLE draft context length mismatch: hidden_context={hidden_context.shape[1]}, "
+                f"draft_input_ids={draft_input_ids.shape[1]}."
+            )
+        inputs_embeds = self.embed_tokens(draft_input_ids).to(hidden_context.dtype)
+        seq_len = hidden_context.shape[1]
+        position_ids = torch.arange(0, seq_len, dtype=torch.long, device=device).unsqueeze(0)
+        attention_mask = torch.ones((1, seq_len), dtype=torch.bool, device=device)
+        decoder_attention_mask = self._prepare_decoder_attention_mask(
+            attention_mask,
+            (1, seq_len),
+            hidden_context,
+            0,
+        )
+        layer_outputs, cache_hidden = self.midlayer(
+            input_emb=inputs_embeds,
+            hidden_states=hidden_context,
+            cache_hidden=[[], []],
+            attention_mask=decoder_attention_mask,
+            position_ids=position_ids,
+            past_key_value=None,
+            output_attentions=False,
+            use_cache=True,
+        )
+        return layer_outputs[0][:, -1:], cache_hidden # layer_outputs is a tuple
+
+    def _draft_cache_token_count(self, cache_hidden):
+        return cache_hidden[0][0].shape[2] + len(cache_hidden[0]) - 1
+
+    def _compact_draft_cache(self, cache_hidden):
+        if len(cache_hidden[0]) <= 1:
+            return cache_hidden
+        return [
+            [torch.cat(cache_hidden[0], dim=2).contiguous()],
+            [torch.cat(cache_hidden[1], dim=2).contiguous()],
+        ]
+
+    @torch.no_grad()
+    # Generate hidden states and update cache of newly generated token
+    def _eagle_draft_decode_one(self, current_hidden, cache_hidden, token, hidden_state=None):
+        device = token.device
+        if hidden_state is None:
+            hidden_state = current_hidden
+        else:
+            hidden_state = hidden_state.to(current_hidden.dtype)
+        input_embeds = self.embed_tokens(token.view(1, 1).to(device)).to(current_hidden.dtype)
+        first_cache_len = cache_hidden[0][0].shape[2]
+        decoder_attention_mask = torch.zeros(
+            (1, 1, 1, first_cache_len),
+            dtype=current_hidden.dtype,
+            device=device,
+        )
+        position_offset = len(cache_hidden[0])
+        position_ids = torch.full(
+            (1, 1),
+            self._draft_cache_token_count(cache_hidden) - position_offset,
+            dtype=torch.long,
+            device=device,
+        )
+        layer_outputs, cache_hidden = self.midlayer(
+            input_emb=input_embeds,
+            hidden_states=hidden_state,
+            cache_hidden=cache_hidden,
+            attention_mask=decoder_attention_mask,
+            position_ids=position_ids,
+            past_key_value=None,
+            output_attentions=False,
+            use_cache=True,
+        )
+        return layer_outputs[0], cache_hidden
+
+    @torch.no_grad()
+    def _eagle_draft_extend_confirmed(self, current_hidden, cache_hidden, hidden_delta, token_delta):
+        for idx in range(token_delta.shape[1]):
+            current_hidden, cache_hidden = self._eagle_draft_decode_one(
+                current_hidden,
+                cache_hidden,
+                token_delta[:, idx],
+                hidden_state=hidden_delta[:, idx:idx + 1],
+            )
+        return current_hidden, self._compact_draft_cache(cache_hidden)
+
+    @torch.no_grad()
+    def _eagle_draft_propose(self, current_hidden, cache_hidden, max_new_tokens):
+        if max_new_tokens <= 0:
+            return [], None
+
+        student_temperature = float(
+            self.train_config.get(
+                "skd_student_temperature",
+                self.train_config.get("skd_temperature", 1.0),
+            )
+        )
+        proposed_tokens = []
+        proposal_hiddens = []
+
+        for draft_idx in range(max_new_tokens):
+            proposal_hiddens.append(current_hidden)
+            logits = self.lm_head(self.norm(current_hidden)).squeeze(1)
+            draft_token = self._sample_token(logits, temperature=student_temperature)
+            target_token = self._draft_to_target_token(draft_token)
+            proposed_tokens.append(target_token.view(1))
+
+            if draft_idx == max_new_tokens - 1:
+                break
+            
+            current_hidden, cache_hidden = self._eagle_draft_decode_one(
+                current_hidden,
+                cache_hidden,
+                target_token.view(1),
+            ) # input single new token, output hidden states for the new token and update cache
+
+        return proposed_tokens, torch.cat(proposal_hiddens, dim=1)
+
+    @torch.no_grad()
+    def rollout_skd(self, input_ids, attention_mask, loss_mask):
+        device = input_ids.device
+        loss_mask = loss_mask.to(device)
+        if attention_mask is None:
+            attention_mask = torch.ones_like(input_ids, device=device)
+        else:
+            attention_mask = attention_mask.to(device)
+
+        gamma = max(int(self.train_config.get("skd_gamma", 5)), 1)
+        max_new_tokens = int(self.train_config.get("skd_max_new_tokens", 256))
+        # max_new_tokens = 256
+        max_len = int(self.train_config.get("max_len", input_ids.shape[1]))
+        teacher_temperature = float(
+            self.train_config.get(
+                "skd_teacher_temperature",
+                self.train_config.get("skd_temperature", 1.0),
+            )
+        )
+        if not bool(self.train_config.get("skd_seed_with_teacher", True)):
+            raise ValueError("EAGLE-compatible SKD rollout requires one initial teacher seed.")
+        eos_token_id = getattr(self.target_model.config, "eos_token_id", None)
+        if isinstance(eos_token_id, (list, tuple)):
+            eos_token_ids = set(eos_token_id)
+        elif eos_token_id is None:
+            eos_token_ids = set()
+        else:
+            eos_token_ids = {int(eos_token_id)}
+
+        batch_input_ids = []
+        batch_attention_mask = []
+        batch_loss_mask = []
+        total_accepted = 0
+        total_checked = 0
+        total_corrections = 0
+        rollout_lengths = []
+
+        for batch_idx in range(input_ids.shape[0]):
+            valid_len = int(attention_mask[batch_idx].long().sum().item())
+            sample_input_ids = input_ids[batch_idx, :valid_len]
+            sample_loss_mask = loss_mask[batch_idx, :valid_len]
+            loss_positions = torch.where(sample_loss_mask > 0)[0]
+
+            if len(loss_positions) == 0:
+                new_input_ids = sample_input_ids
+                new_attention_mask = torch.ones_like(new_input_ids, device=device)
+                new_loss_mask = torch.zeros_like(new_input_ids, device=device)
+                batch_input_ids.append(new_input_ids)
+                batch_attention_mask.append(new_attention_mask)
+                batch_loss_mask.append(new_loss_mask)
+                rollout_lengths.append(0)
+                continue
+
+            prompt_len = max(int(loss_positions[0].item()), 1)
+            target_new_tokens = min(
+                int(sample_loss_mask.sum().item()),
+                max_new_tokens,
+                max(max_len - prompt_len, 0),
+            )
+            prefix_ids = sample_input_ids[:prompt_len].view(1, -1)
+            generated = prefix_ids.clone()
+            generated_loss_mask = [0] * prompt_len
+            generated_new_tokens = 0
+            hidden_context = None
+            teacher_past = None
+            draft_current_hidden = None
+            draft_cache_hidden = None
+
+            if target_new_tokens > 0:
+                prefix_attention_mask = torch.ones_like(generated, device=device)
+                teacher_outputs = self.target_model(
+                    input_ids=generated,
+                    attention_mask=prefix_attention_mask,
+                    use_cache=True,
+                    output_hidden_states=True,
+                )
+                teacher_logits = teacher_outputs.logits[:, -1, :]
+                seed_token = self._sample_token(teacher_logits, temperature=teacher_temperature)
+                hidden_context = self.fc(self._target_hidden_from_outputs(teacher_outputs))
+                teacher_past = teacher_outputs.past_key_values
+                if teacher_past is None:
+                    raise RuntimeError("target_model did not return past_key_values; cached SKD rollout requires use_cache=True.")
+                generated = torch.cat((generated, seed_token.to(device)), dim=1)
+                generated_loss_mask.append(1)
+                generated_new_tokens += 1
+                draft_current_hidden, draft_cache_hidden = self._eagle_draft_prefill(hidden_context, generated)
+
+                if int(seed_token.item()) in eos_token_ids:
+                    target_new_tokens = generated_new_tokens
+
+            while generated_new_tokens < target_new_tokens and generated.shape[1] < max_len:
+                remaining_tokens = min(
+                    gamma,
+                    target_new_tokens - generated_new_tokens,
+                    max_len - generated.shape[1],
+                )
+                if remaining_tokens <= 0:
+                    continue
+
+                draft_tokens, proposal_hiddens = self._eagle_draft_propose(
+                    draft_current_hidden,
+                    draft_cache_hidden,
+                    remaining_tokens,
+                )
+                if not draft_tokens:
+                    continue
+
+                candidate_ids = torch.cat([token.view(1, 1).to(device) for token in draft_tokens], dim=1) # shape (1, len_draft_tokens)
+                verify_input_ids = torch.cat((generated[:, -1:], candidate_ids), dim=1)
+                
+                verify_outputs = self.target_model(
+                    input_ids=verify_input_ids,
+                    past_key_values=teacher_past,
+                    use_cache=True,
+                    output_hidden_states=False,
+                )
+                verify_logits = verify_outputs.logits[:, :-1, :]
+                verify_past = verify_outputs.past_key_values
+
+                accepted_mask = self._teacher_acceptance_mask(candidate_ids, verify_logits).squeeze(0)
+                if bool(accepted_mask.all().item()):
+                    accepted_prefix_len = candidate_ids.shape[1]
+                    rejected = False
+                else:
+                    accepted_prefix_len = int((~accepted_mask).nonzero(as_tuple=False)[0].item())
+                    rejected = True
+
+                confirmed_count = min(
+                    accepted_prefix_len,
+                    target_new_tokens - generated_new_tokens,
+                    max_len - generated.shape[1],
+                )
+                hit_eos = False
+                if confirmed_count > 0 and eos_token_ids:
+                    eos_mask = torch.zeros((confirmed_count,), dtype=torch.bool, device=device)
+                    for eos_id in eos_token_ids:
+                        eos_mask |= candidate_ids[0, :confirmed_count].eq(eos_id)
+                    if bool(eos_mask.any().item()):
+                        confirmed_count = int(eos_mask.nonzero(as_tuple=False)[0].item()) + 1
+                        hit_eos = True
+
+                self._debug_teacher_acceptance(
+                    candidate_ids,
+                    verify_logits,
+                    accepted_mask,
+                    accepted_prefix_len,
+                    confirmed_count,
+                )
+
+                if confirmed_count > 0:
+                    accepted_tokens = candidate_ids[:, :confirmed_count]
+                    generated = torch.cat((generated, accepted_tokens), dim=1)
+                    generated_loss_mask.extend([1] * confirmed_count)
+                    generated_new_tokens += confirmed_count
+                    total_accepted += confirmed_count
+                total_checked += confirmed_count
+
+                replacement_token = None
+                can_replace = (
+                    rejected
+                    and confirmed_count == accepted_prefix_len
+                    and not hit_eos
+                    and generated_new_tokens < target_new_tokens
+                    and generated.shape[1] < max_len
+                    and int(generated[0, -1].item()) not in eos_token_ids
+                )
+                if can_replace:
+                    total_checked += 1
+                    replacement_token = self._sample_token(
+                        verify_logits[:, accepted_prefix_len, :],
+                        temperature=teacher_temperature,
+                    )
+                    generated = torch.cat((generated, replacement_token.to(device)), dim=1)
+                    generated_loss_mask.append(1)
+                    generated_new_tokens += 1
+                    total_corrections += 1
+
+                last_token = int(generated[0, -1].item())
+                if replacement_token is None and confirmed_count > 0:
+                    teacher_past = self._crop_teacher_past(verify_past, generated.shape[1] - 1)
+                    hidden_delta = proposal_hiddens[:, :confirmed_count]
+                    token_delta = candidate_ids[:, :confirmed_count]
+                    draft_current_hidden, draft_cache_hidden = self._eagle_draft_extend_confirmed(
+                        draft_current_hidden,
+                        draft_cache_hidden,
+                        hidden_delta,
+                        token_delta,
+                    )
+                elif replacement_token is not None:
+                    teacher_past = self._crop_teacher_past(verify_past, generated.shape[1] - 1)
+                    hidden_delta = proposal_hiddens[:, :confirmed_count + 1]
+                    token_delta = torch.cat(
+                        (candidate_ids[:, :confirmed_count], replacement_token.to(device)),
+                        dim=1,
+                    )
+                    draft_current_hidden, draft_cache_hidden = self._eagle_draft_extend_confirmed(
+                        draft_current_hidden,
+                        draft_cache_hidden,
+                        hidden_delta,
+                        token_delta,
+                    )
+                if last_token in eos_token_ids:
+                    break
+
+            new_input_ids = generated.squeeze(0)
+            new_attention_mask = torch.ones_like(new_input_ids, device=device)
+            new_loss_mask = torch.tensor(generated_loss_mask, dtype=loss_mask.dtype, device=device)
+            batch_input_ids.append(new_input_ids)
+            batch_attention_mask.append(new_attention_mask)
+            batch_loss_mask.append(new_loss_mask)
+            rollout_lengths.append(int(new_loss_mask.sum().item()))
+
+        padded_len = max(tensor.shape[0] for tensor in batch_input_ids)
+        padded_input_ids = []
+        padded_attention_mask = []
+        padded_loss_mask = []
+        pad_token_id = self.padding_idx if self.padding_idx is not None else 0
+        for ids, attn, mask in zip(batch_input_ids, batch_attention_mask, batch_loss_mask):
+            pad_len = padded_len - ids.shape[0]
+            if pad_len > 0:
+                ids = torch.cat((ids, torch.full((pad_len,), pad_token_id, dtype=ids.dtype, device=device)), dim=0)
+                attn = torch.cat((attn, torch.zeros(pad_len, dtype=attn.dtype, device=device)), dim=0)
+                mask = torch.cat((mask, torch.zeros(pad_len, dtype=mask.dtype, device=device)), dim=0)
+            padded_input_ids.append(ids)
+            padded_attention_mask.append(attn)
+            padded_loss_mask.append(mask)
+
+        self.last_skd_stats = {
+            "accept_rate": total_accepted / (total_checked + 1e-6),
+            "correction_rate": total_corrections / (total_checked + 1e-6),
+            "avg_rollout_len": sum(rollout_lengths) / (len(rollout_lengths) + 1e-6),
+        }
+        return (
+            torch.stack(padded_input_ids, dim=0),
+            torch.stack(padded_attention_mask, dim=0),
+            torch.stack(padded_loss_mask, dim=0),
+        )
+
     @torch.no_grad()
     def dataprepare(self, input_ids, attention_mask, loss_mask):
         device = input_ids.device
@@ -766,8 +1286,14 @@ class Model(nn.Module):
             output_attentions: Optional[bool] = None,
             output_hidden_states: Optional[bool] = None,
             loss_mask: Optional[torch.Tensor] = None,
+            skd_rollout: bool = False,
 
     ):
+        if skd_rollout:
+            input_ids, attention_mask, loss_mask = self.rollout_skd(input_ids, attention_mask, loss_mask)
+        else:
+            self.last_skd_stats = None
+
         hidden_states, target, loss_mask, input_ids = self.dataprepare(input_ids, attention_mask, loss_mask)
 
         batch_size, seq_length, _ = hidden_states.shape
